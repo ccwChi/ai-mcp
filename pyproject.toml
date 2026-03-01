@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-mcp"
+version = "0.1.0"
+description = "A basic Python Model Context Protocol (MCP) server."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "google-genai>=0.3.0",
+    "python-dotenv>=1.0.0",
+    "notion-client>=2.2.1",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+ai-mcp = "ai_mcp.server:main"

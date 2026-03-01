@@ -1,0 +1,143 @@
+# 如何在 GCP 設定「達上限自動停用帳單」避免超刷信用卡
+
+為了確保您最高只花費 $10 的免費額度，我們需要在 Google Cloud Platform (GCP) 設定一個**「預算警示 + 自動停權」**的機制。當系統偵測到花費達到設定值 (例如 $9.5)，就會透過一小段腳本自動切斷專案的信用卡授權。切斷後，您的付費 API Key 就會失效，並被我們剛剛寫的 MCP 程式攔截並降級為免費 API。
+
+以下是完整的設定步驟：
+
+---
+
+## 步驟一：建立預算 (Budget) 與警示通知 (Alerts)
+
+此步驟的目的是告訴 Google 你的預算是多少，並在快花完時發送訊號。
+
+1. **登入 GCP 控制台**:
+   前往 [Google Cloud Console](https://console.cloud.google.com/)，確保頂端下拉選單選擇了您綁定信用卡的**付費專案**。
+2. **進入「帳單 (Billing)」**:
+   點擊左上角的三條線選單 ☰，選擇 **帳單 (Billing)**。
+3. **前往「預算與快訊 (Budgets & alerts)」**:
+   在左側選單中找到並點擊「預算與快訊」。
+4. **建立新預算**:
+   點擊右上角的 **+ 建立預算 (CREATE BUDGET)**。
+   - **名稱 (Name)**: 輸入容易識別的名稱，例如 `Gemini-10-limit`。
+   - **範圍 (Scope)**: 確認專案選擇正確，點擊繼續。
+   - **金額 (Amount)**: 選擇「指定金額 (Specified amount)」，並輸入目標金額，**強烈建議設定為 $9.5 或 $10.0**，以保留一點系統結算的時間差緩衝。
+5. **設定動作 (Actions)** (最重要的部分):
+   往下捲動到「管理通知 (Manage notifications)」。
+   - 打勾 **將 Pub/Sub 主題連結至這個預算 (Link a Pub/Sub topic to this budget)**。
+   - 點擊下拉選單，選擇 **建立主題 (Create a topic)**。
+   - 彈出視窗中，主題 ID 輸入 `billing-alerts`，然後點擊「建立」。
+   - 最後點擊最下方的 **儲存 (Save)**。
+
+---
+
+## 步驟二：撰寫 Cloud Functions 腳本 (自動拔插頭)
+
+有了警告訊號後，我們需要寫一支小程式 (Cloud Function)，當它收到 `billing-alerts` 發出的警告時，就立刻關閉帳單。
+
+1. **進入 Cloud Functions**:
+   左上角選單 ☰，尋找並點擊 **Cloud Functions** (如果找不到，可以在頂端搜尋列搜尋)。
+   > _(第一次使用可能會要求您啟用幾個相關的 API，直接點擊啟用即可。)_
+2. **建立函式**:
+   點擊右上角的 **+ 建立函式 (CREATE FUNCTION)**。
+3. **設定函式基準資料**:
+   - **環境**: 第 1 代 (1st gen) 或 第 2 代 (2nd gen) 皆可，推薦 第 1 代最簡單。
+   - **名稱**: `stop-billing-script`
+   - **地區**: 選擇離您最近的 (如 `asia-east1` 台灣)。
+   - **觸發條件 (Trigger)**:
+     - 觸發條件類型選擇 **Cloud Pub/Sub**。
+     - 選擇剛剛建立的主題：`billing-alerts`。
+     - 點擊「儲存」再點擊「下一步 (Next)」。
+4. **貼上截斷帳單的程式碼**:
+   在進入程式碼編輯頁面後：
+   - **執行階段 (Runtime)**: 選擇 **Python 3.10** (或以上)。
+   - **進入點 (Entry point)**: 輸入 `stop_billing`。
+
+   **修改 [requirements.txt](file:///c:/Users/p1990/project/ai-mcp/requirements.txt)**: 點開 [requirements.txt](file:///c:/Users/p1990/project/ai-mcp/requirements.txt) 分頁，貼上以下內容：
+   ```text
+   google-api-python-client
+   ```
+
+   **修改 `main.py`**: 點開 `main.py` 分頁，將裡面的內容全刪除，並貼上以下官方提供的 Python 腳本：
+   ```python
+   import base64
+   import json
+   from googleapiclient import discovery
+
+   # 您的專案 ID (可以在首頁看到，長得像 my-project-123456)
+   PROJECT_ID = '在這裡填入你的完整_專案ID'
+   # 您剛剛設定的預算金額
+   MAX_BUDGET = 9.5
+
+   def stop_billing(event, context):
+       pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+       pubsub_data = json.loads(pubsub_message)
+       
+       # 取得目前的預算花費總額
+       cost_amount = pubsub_data['costAmount']
+       
+       print(f"目前累計花費: ${cost_amount}")
+
+       # 如果目前花費大於或等於我們設定的上限，就呼叫 API 關閉帳單
+       if cost_amount >= MAX_BUDGET:
+           print("警告：花費已超過設定上限！準備停用專案帳單功能...")
+           __disable_billing()
+       else:
+           print("花費尚未超標，保持帳單啟用狀態。")
+
+   def __disable_billing():
+       billing = discovery.build('cloudbilling', 'v1', cache_discovery=False)
+       
+       project_name = f'projects/{PROJECT_ID}'
+       
+       # 取得目前的帳單資訊
+       billing_info = billing.projects().getBillingInfo(name=project_name).execute()
+       
+       # 如果帳單是開啟的
+       if billing_info['billingAccountName']:
+           # 將帳單名稱設為空字串，等同於解除綁定信用卡
+           billing_info['billingAccountName'] = ''
+           
+           res = billing.projects().updateBillingInfo(
+               name=project_name,
+               body=billing_info
+           ).execute()
+           print(f"專案 {PROJECT_ID} 帳單已成功停用！現在 API 已回歸免費/停權狀態。")
+       else:
+           print("該專案尚未綁定任何帳單帳戶，無須停用。")
+   ```
+   > 🔴 **重要：** 請務必將程式碼中第二行的 `PROJECT_ID = '在這裡填入你的完整_專案ID'` 改成您自己的專案 ID。
+
+5. **部署 (Deploy)**:
+   完成後點擊最下方的 **部署 (Deploy)**，等待幾分鐘出現綠色勾勾即可。
+
+---
+
+## 步驟三：賦予 Cloud Functions 更改帳單的權限
+
+現在腳本已經部署好了，但它還沒有「權限」去幫您拔掉信用卡設定。這是最後一步！
+
+1. **尋找您的服務帳戶 (Service Account)**:
+   - 剛剛部署完成後，點擊您剛剛建立的 `stop-billing-script` 函式名稱進入詳細頁面。
+   - 點擊「詳細資料 (Details)」分頁。
+   - 找到「身分識別 (Service account)」，複製那一長串的 Email 地址。(通常格式為: `您的專案名稱@appspot.gserviceaccount.com` 或帶有 Cloud Functions 字樣的信箱)。
+2. **進入「帳單 (Billing)」賦予管理員權限**:
+   - 再次從左上角選單 ☰ 進入 **帳單 (Billing)** -> 選擇 **帳單帳戶管理 (Account Management)**。
+   - 在右側面板 (通常叫「權限 / Info Panel」)，點擊 **新增主體 (ADD PRINCIPAL)**。
+   - **新的主體 (New principals)** 欄位貼上剛剛複製的 Service Account 信箱。
+   - **角色 (Role)** 選擇 -> `Billing` (帳單) -> `Billing Account Administrator` (帳單帳戶管理員)。
+   - 點擊「儲存」。
+
+---
+
+### 🎉 設定大功告成！
+
+**這套系統日後將如何運作？**
+當您快樂地使用 Gemini API 付費版時，每一次花費都會計入 GCP 控制台。
+當 Google 結算目前累積花費達到 $9.5 時：
+1. 預算系統會發出一則「快破產啦」的通知到 Pub/Sub。
+2. 我們寫的 Python Cloud Function 聽到廣播，馬上跑起來。
+3. 它檢查您超過了 $9.5，立刻動用管理員權限，無情地將您專案的信用卡拔除解除綁定！
+4. 您的 API Request 將立刻開始收到 `Error: Quota Exceeded` 或 `Billing Not Enabled`。
+5. 我們剛寫好的 MCP 程式的 `try/except` 完美接殺這個錯誤，並立刻幫您切換到完全免費（未綁卡）的 `GEMINI_FREE_API_KEY` 繼續提供服務！
+
+這樣，就算是 Google 原廠計費系統算錯，也絕不可能從您的信用卡偷扣走任何半毛錢！您能夠 100% 放心使用那張 $10 折價卷了！
